@@ -6,78 +6,103 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
-	"os"
-	"text/template"
+	"time"
 
 	"github.com/pkg/errors"
+	"github.com/rs/zerolog/log"
+	"github.com/threefoldtech/zbus"
+	"github.com/threefoldtech/zos/pkg/stubs"
 )
 
 // Config the plugin configuration.
 type Config struct {
-	Headers map[string]string `json:"headers,omitempty"`
+	WID       string `json:"wid,omitempty"`
+	MsgBroker string `json:"broker,omitempty"`
 }
 
 // CreateConfig creates the default plugin configuration.
 func CreateConfig() *Config {
 	return &Config{
-		Headers: make(map[string]string),
+		WID: "",
 	}
 }
 
 // Demo a Demo plugin.
 type Demo struct {
-	next     http.Handler
-	headers  map[string]string
-	name     string
-	template *template.Template
+	next    http.Handler
+	name    string
+	WID     string
+	gateway *stubs.GatewayStub
 }
 
 // New created a new Demo plugin.
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	if len(config.Headers) == 0 {
-		return nil, fmt.Errorf("headers cannot be empty")
+	if len(config.WID) == 0 {
+		return nil, fmt.Errorf("WID (workload id) cannot be empty")
 	}
+	if len(config.MsgBroker) == 0 {
+		config.MsgBroker = "unix:///var/run/redis.sock"
+	}
+	client, err := zbus.NewRedisClient(config.MsgBroker)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to connect to zbus broker")
+	}
+	gateway := stubs.NewGatewayStub(client)
 
 	return &Demo{
-		headers:  config.Headers,
-		next:     next,
-		name:     name,
-		template: template.New("demo").Delims("[[", "]]"),
+		WID:     config.WID,
+		next:    next,
+		name:    name,
+		gateway: gateway,
 	}, nil
 }
 
 func headerSize(h http.Header) int {
+	// some headers are not sent from the client
+	// like X-Forwarded-Server, should they be counted or not?
 	size := 1
 	for k, v := range h {
-		size += len(k) + len(v) + 1
+		for _, e := range v {
+			size += len(k) + len(e) + 3
+		}
 	}
 	return size
 }
 
-func appendToFile(s string) {
-	file, err := os.OpenFile("/tmp/temp.txt", os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Println(errors.Wrap(err, "failed to open file"))
-	}
-	defer file.Close()
-	if _, err := file.WriteString(s); err != nil {
-		log.Println(errors.Wrap(err, "failed to write to file"))
-	}
-}
-
 func (a *Demo) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	wrapper := NewResponseWritrWrapper(rw)
-
 	wr := NewBodyWrapper(req.Body)
 	wr.read += uint64(headerSize(req.Header))
-	appendToFile(fmt.Sprintf("header size %d: %v\n", wr.read, req.Header))
+	log.Debug().Uint64("length", wr.read).Str("content", fmt.Sprintf("%v", req.Header)).Msg("headers")
+	wr.read += uint64(len("Host: ") + len(req.Host) + 1) // host is stripped from the headers
+	log.Debug().Int("length", len("Host: ")+len(req.Host)+1).Str("content", req.Host).Msg("host header")
+	wr.read += uint64(len(req.Proto)) + 1
+	log.Debug().Int("length", len(req.Proto)).Str("content", req.Proto).Msg("request protocol")
+	wr.read += uint64(len(req.URL.Path)) + 1
+	log.Debug().Int("length", len(req.URL.Path)+1).Str("content", req.URL.Path).Msg("request path")
+	wr.read += uint64(len(req.Method)) + 1
+	log.Debug().Int("length", len(req.Method)).Str("content", req.Method).Msg("request method")
+
 	req.Body = wr
 	a.next.ServeHTTP(wrapper, req)
-	appendToFile(fmt.Sprintf("total sent %:\n", wrapper.sent))
-	appendToFile(fmt.Sprintf("total received %d\n", wr.read))
+
+	responseHeaderSize := headerSize(wrapper.Header())
+	wrapper.sent += uint64(responseHeaderSize)
+	log.Debug().Int("length", len(wrapper.Header())).Str("content", fmt.Sprintf("%v\n", wrapper.Header()))
+	wrapper.sent += uint64(len(req.Proto) + 1)
+	log.Debug().Int("length", len(req.Proto)).Str("content", req.Proto).Msg("response protocol")
+	// it panics for some reason, on the house?
+	// wrapper.sent += uint64(len(req.Response.Status) + 1)
+
+	log.Debug().Uint64("value", wr.read).Msg("total received")
+	log.Debug().Uint64("value", wrapper.sent).Msg("total sent")
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
+		defer cancel()
+		a.gateway.ReportConsumption(ctx, a.WID, wrapper.sent, wr.read)
+	}()
 }
 
 type BodyWrapper struct {
@@ -99,7 +124,7 @@ func (b *BodyWrapper) Close() error {
 func (b *BodyWrapper) Read(p []byte) (int, error) {
 	r, e := b.body.Read(p)
 	b.read += uint64(r)
-	appendToFile(fmt.Sprintf("read another %d: %s\n", r, string(p)))
+	log.Debug().Str("body", string(p)).Int("len", r).Msg("read")
 	return r, e
 }
 
@@ -122,7 +147,7 @@ func (r *ResponseWriterWrapper) Header() http.Header {
 func (r *ResponseWriterWrapper) Write(d []byte) (int, error) {
 	x := uint64(len(d))
 	r.sent += x
-	appendToFile(fmt.Sprintf("send another %d: %s\n", x, string(d)))
+	log.Debug().Str("body", string(d)).Uint64("len", x).Msg("sending")
 	return r.rw.Write(d)
 }
 
